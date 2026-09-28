@@ -40,7 +40,7 @@ dependencies {
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.espresso.core)
     androidTestImplementation(libs.androidx.junit)
-    implementation("dev.rikka.shizuku:api:12.2.0")// API do Shizuku
+    implementation("dev.rikka.shizuku:api:12.2.0") // Shizuku API
     implementation("dev.rikka.shizuku:provider:12.2.0")
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")    // Coroutines (Necessário para o loop e timer não travarem o app)
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3") // Coroutines (Required so the click loop doesn't freeze the app)
 }

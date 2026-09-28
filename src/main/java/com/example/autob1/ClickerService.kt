@@ -1,4 +1,4 @@
-package com.example.autob1 // MANTENHA O SEU PACOTE AQUI
+package com.example.autob1
 
 import android.annotation.SuppressLint
 import android.app.Notification
@@ -24,25 +24,32 @@ import rikka.shizuku.Shizuku
 class ClickerService : Service() {
 
     private lateinit var windowManager: WindowManager
-    private lateinit var floatingView: LinearLayout
+    private lateinit var floatingOverlay: LinearLayout
     private lateinit var layoutParams: WindowManager.LayoutParams
     private lateinit var btnStartStop: Button
 
-    // Escopo para rodar o loop na UI e disparar comandos em background
+    // Scope to run the click loop on background thread without freezing the UI
     private val serviceScope = CoroutineScope(Dispatchers.Main + Job())
     private var clickJob: Job? = null
     private var isRunning = false
+    private var intervalMs: Long = 1000L
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
-        iniciarForegroundService() // OBRIGATÓRIO: Impede que o app crashe após 5s
+        startForegroundNotification() // Required to prevent Android from killing the background service
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
-        configurarInterfaceFlutuante()
+        setupFloatingOverlay()
     }
 
-    private fun iniciarForegroundService() {
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        intervalMs = intent?.getLongExtra(EXTRA_INTERVAL_MS, 1000L) ?: 1000L
+        
+        return START_STICKY
+    }
+
+    private fun startForegroundNotification() {
         val channelId = "ClickerServiceChannel"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
@@ -55,23 +62,23 @@ class ClickerService : Service() {
         }
 
         val notification: Notification = NotificationCompat.Builder(this, channelId)
-            .setContentTitle("Auto Clicker Ativo")
-            .setContentText("A mira flutuante está na tela.")
-            .setSmallIcon(android.R.drawable.ic_menu_compass) // Troque pelo ícone do seu app
+            .setContentTitle("Auto Clicker Active")
+            .setContentText("Floating clicker is active on screen.")
+            .setSmallIcon(android.R.drawable.ic_menu_compass)
             .build()
 
         startForeground(1, notification)
     }
 
     @SuppressLint("ClickableViewAccessibility")
-    private fun configurarInterfaceFlutuante() {
-        floatingView = LinearLayout(this).apply {
+    private fun setupFloatingOverlay() {
+        floatingOverlay = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.parseColor("#99000000"))
             setPadding(10, 10, 10, 10)
         }
 
-        // ALÇA DE ARRASTAR - só esta barra move o painel
+        // DRAG HANDLE - only dragging this bar moves the overlay
         val dragHandle = TextView(this).apply {
             text = "move"
             setTextColor(Color.WHITE)
@@ -84,10 +91,11 @@ class ClickerService : Service() {
             ).apply {
                 bottomMargin = 20
             }
-            setPadding(0, 10, 0, 10) // espaçamento vertical para dar altura
+            setPadding(0, 10, 0, 10)
         }
 
-        val mira = TextView(this).apply {
+        // Crosshair target marker
+        val targetMarker = TextView(this).apply {
             text = "X"
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
@@ -98,18 +106,18 @@ class ClickerService : Service() {
         btnStartStop = Button(this).apply {
             text = "loop"
             setOnClickListener {
-                if (isRunning) pararClique() else iniciarClique()
+                if (isRunning) stopClickLoop() else startClickLoop()
             }
         }
 
-        floatingView.addView(dragHandle)
-        floatingView.addView(mira)
-        floatingView.addView(btnStartStop)
+        floatingOverlay.addView(dragHandle)
+        floatingOverlay.addView(targetMarker)
+        floatingOverlay.addView(btnStartStop)
 
-        val larguraPx = (90 * resources.displayMetrics.density).toInt()
+        val panelWidthPx = (90 * resources.displayMetrics.density).toInt()
         layoutParams = WindowManager.LayoutParams(
-            larguraPx, // <- largura adaptável em dp
-            WindowManager.LayoutParams.WRAP_CONTENT, // altura ainda se adapta ao conteúdo
+            panelWidthPx,
+            WindowManager.LayoutParams.WRAP_CONTENT,
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
             else WindowManager.LayoutParams.TYPE_PHONE,
@@ -121,7 +129,7 @@ class ClickerService : Service() {
             y = 400
         }
 
-        // LISTENER DE ARRASTAR só na alça, não no painel todo!
+        // Touch listener for dragging the handle
         dragHandle.setOnTouchListener(object : View.OnTouchListener {
             private var initialX = 0
             private var initialY = 0
@@ -140,7 +148,7 @@ class ClickerService : Service() {
                     MotionEvent.ACTION_MOVE -> {
                         layoutParams.x = initialX + (event.rawX - initialTouchX).toInt()
                         layoutParams.y = initialY + (event.rawY - initialTouchY).toInt()
-                        windowManager.updateViewLayout(floatingView, layoutParams)
+                        windowManager.updateViewLayout(floatingOverlay, layoutParams)
                         return true
                     }
                 }
@@ -148,61 +156,70 @@ class ClickerService : Service() {
             }
         })
 
-        windowManager.addView(floatingView, layoutParams)
+        windowManager.addView(floatingOverlay, layoutParams)
     }
 
-    private fun iniciarClique() {
+    private fun startClickLoop() {
         isRunning = true
         btnStartStop.text = "stop"
-        val intervaloMs =   5000L
+        
+        // Subtract 50ms to compensate for shell process and IPC execution overhead
+        val adjustedDelayMs = (intervalMs - 50L).coerceAtLeast(0L)
+
         clickJob = serviceScope.launch(Dispatchers.IO) {
             while (isActive) {
-                delay(intervaloMs) // Espera PRIMEIRO, depois clica
-                val alvoX = layoutParams.x + (floatingView.width / 2)
-                val alvoY = layoutParams.y + floatingView.height - 45
+                delay(adjustedDelayMs)
+                val targetX = layoutParams.x + (floatingOverlay.width / 2)
+                val targetY = layoutParams.y + floatingOverlay.height - 45
                 try {
-                    // 1. Torna a janela intocável para o tap passar para o jogo
+                    // 1. Temporarily make overlay untouchable so the tap passes to the underlying app
                     withContext(Dispatchers.Main) {
                         layoutParams.flags = layoutParams.flags or
                                 WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                        windowManager.updateViewLayout(floatingView, layoutParams)
+                        windowManager.updateViewLayout(floatingOverlay, layoutParams)
                     }
-                    // 2. Executa o tap
-                    val comando = "input tap $alvoX $alvoY"
+
+                    // 2. Dispatch tap command via Shizuku
+                    val command = "input tap $targetX $targetY"
                     val process = Shizuku.newProcess(
-                        arrayOf("sh", "-c", comando), null, null
+                        arrayOf("sh", "-c", command), null, null
                     )
                     process.waitFor()
-                    // 3. Restaura a touchabilidade da janela
+
+                    // 3. Restore overlay touchability
                     withContext(Dispatchers.Main) {
                         layoutParams.flags = layoutParams.flags and
                                 WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
-                        windowManager.updateViewLayout(floatingView, layoutParams)
+                        windowManager.updateViewLayout(floatingOverlay, layoutParams)
                     }
                 } catch (e: Exception) {
                     e.printStackTrace()
-                    // Garante que a janela não fica presa em modo intocável
+                    // Ensure the overlay does not get stuck in untouchable state
                     withContext(Dispatchers.Main) {
                         layoutParams.flags = layoutParams.flags and
                                 WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
-                        windowManager.updateViewLayout(floatingView, layoutParams)
+                        windowManager.updateViewLayout(floatingOverlay, layoutParams)
                     }
                 }
             }
         }
     }
 
-    private fun pararClique() {
+    private fun stopClickLoop() {
         isRunning = false
         btnStartStop.text = "loop"
-        clickJob?.cancel() // Interrompe o Loop instantaneamente
+        clickJob?.cancel() // Cancel the loop immediately
     }
 
     override fun onDestroy() {
         super.onDestroy()
         serviceScope.cancel()
-        if (::floatingView.isInitialized) {
-            windowManager.removeView(floatingView)
+        if (::floatingOverlay.isInitialized) {
+            windowManager.removeView(floatingOverlay)
         }
+    }
+
+    companion object {
+        const val EXTRA_INTERVAL_MS = "EXTRA_INTERVAL_MS"
     }
 }

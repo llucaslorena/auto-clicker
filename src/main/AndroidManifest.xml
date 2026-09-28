@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
-    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/><!-- Permissões necessárias -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/><!-- Required permissions -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" /><!-- Necessário para rodar o Foreground Service no Android 14+ -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" /><!-- Required for Foreground Service on Android 14+ -->
 
     <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
     <application
