@@ -8,9 +8,13 @@ import android.os.Bundle
 import android.provider.Settings
 import android.text.InputType
 import android.view.Gravity
+import android.view.View
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
@@ -20,11 +24,11 @@ class MainActivity : AppCompatActivity() {
 
     private val SHIZUKU_CODE = 100
     private lateinit var etInterval: EditText
+    private var selectedColor = "blue"
 
-    // Listens for the user's response in the Shizuku permission dialog
     private val permissionListener = Shizuku.OnRequestPermissionResultListener { requestCode, grantResult ->
         if (requestCode == SHIZUKU_CODE && grantResult == PackageManager.PERMISSION_GRANTED) {
-            checkPermissionsAndStart()
+            checkPermissionsAndAdd()
         } else {
             Toast.makeText(this, "Shizuku permission denied!", Toast.LENGTH_SHORT).show()
         }
@@ -32,11 +36,8 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
-        // Register Shizuku listener
         Shizuku.addRequestPermissionResultListener(permissionListener)
 
-        // Vertical layout for input field and start button
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
@@ -51,56 +52,88 @@ class MainActivity : AppCompatActivity() {
 
         etInterval = EditText(this).apply {
             hint = "e.g. 1000 (1 second)"
-            setText("1000") // Default to 1000ms
+            setText("1000")
             inputType = InputType.TYPE_CLASS_NUMBER
             textSize = 18f
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                bottomMargin = 30
-            }
+            ).apply { bottomMargin = 30 }
         }
 
-        val btnStart = Button(this).apply {
-            text = "Start Auto Clicker"
+        val tvColorLabel = TextView(this).apply {
+            text = "Select Color:"
+            textSize = 16f
+            setPadding(0, 0, 0, 16)
+        }
+
+        val colors = ClickerService.THEMES.keys.toList()
+        val spinner = Spinner(this).apply {
+            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, colors)
+            onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                    selectedColor = colors[position]
+                }
+                override fun onNothingSelected(parent: AdapterView<*>?) {}
+            }
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = 40 }
+        }
+
+        val btnAdd = Button(this).apply {
+            text = "Add Clicker"
+            textSize = 16f
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = 20 }
+            setOnClickListener { checkPermissionsAndAdd() }
+        }
+
+        val btnStopAll = Button(this).apply {
+            text = "Stop All Clickers"
             textSize = 16f
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             )
             setOnClickListener {
-                checkPermissionsAndStart()
+                val intent = Intent(this@MainActivity, ClickerService::class.java).apply {
+                    action = ClickerService.ACTION_REMOVE_ALL
+                }
+                startService(intent)
+                Toast.makeText(this@MainActivity, "All clickers stopped", Toast.LENGTH_SHORT).show()
             }
         }
 
         layout.addView(tvLabel)
         layout.addView(etInterval)
-        layout.addView(btnStart)
+        layout.addView(tvColorLabel)
+        layout.addView(spinner)
+        layout.addView(btnAdd)
+        layout.addView(btnStopAll)
 
         setContentView(layout)
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        // Unregister listener to prevent memory leaks
         Shizuku.removeRequestPermissionResultListener(permissionListener)
     }
 
-    private fun checkPermissionsAndStart() {
-        // 1. Verify if Shizuku service is running
+    private fun checkPermissionsAndAdd() {
         if (!Shizuku.pingBinder()) {
             Toast.makeText(this, "Shizuku is not running!", Toast.LENGTH_LONG).show()
             return
         }
 
-        // 2. Check for Shizuku permission
         if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
             Shizuku.requestPermission(SHIZUKU_CODE)
             return
         }
 
-        // 3. Check for Screen Overlay ("Display over other apps") permission
         if (!Settings.canDrawOverlays(this)) {
             val intent = Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
             startActivity(intent)
@@ -108,19 +141,18 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        // 4. Retrieve input interval (minimum 50ms guard against system lockup)
         val intervalMs = etInterval.text.toString().toLongOrNull()?.coerceAtLeast(50L) ?: 1000L
 
-        // 5. Start the floating service with the interval extra
         val serviceIntent = Intent(this, ClickerService::class.java).apply {
+            action = ClickerService.ACTION_ADD
             putExtra(ClickerService.EXTRA_INTERVAL_MS, intervalMs)
+            putExtra(ClickerService.EXTRA_COLOR_NAME, selectedColor)
         }
+        
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             startForegroundService(serviceIntent)
         } else {
             startService(serviceIntent)
         }
-
-        finish() // Minimize activity and display only the floating overlay
     }
 }

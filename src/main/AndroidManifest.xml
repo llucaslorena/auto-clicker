@@ -20,6 +20,7 @@
             android:enabled="true"
             android:exported="false"
             android:foregroundServiceType="specialUse" />
+
         <provider
             android:name="rikka.shizuku.ShizukuProvider"
             android:authorities="${applicationId}.shizuku"
