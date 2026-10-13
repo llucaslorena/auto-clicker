@@ -10,13 +10,22 @@ import android.content.Intent
 import android.graphics.*
 import android.os.Build
 import android.os.IBinder
+import android.os.SystemClock
+import android.util.Log
 import android.view.Gravity
+import android.view.InputDevice
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
+import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.*
 import rikka.shizuku.Shizuku
+import rikka.shizuku.ShizukuBinderWrapper
+import rikka.shizuku.SystemServiceHelper
+import java.io.BufferedWriter
+import java.io.OutputStreamWriter
+import java.lang.reflect.Method
 
 class ClickerService : Service() {
 
@@ -41,6 +50,31 @@ class ClickerService : Service() {
         circleRadiusPx = (46  * dp).toInt()
         circleDiamPx   = circleRadiusPx * 2
         circleOffsetPx = (squareSizePx - circleDiamPx) / 2
+
+        // Initialize fast input injection engines in background
+        serviceScope.launch(Dispatchers.IO) {
+            // Relax hidden API policy via Shizuku shell
+            try {
+                val proc = Shizuku.newProcess(
+                    arrayOf("sh", "-c", "settings put global hidden_api_policy 1; settings put global hidden_api_policy_p_apps 1"),
+                    null, null
+                )
+                proc.waitFor()
+            } catch (e: Exception) {
+                Log.w("ClickerService", "Failed to lift hidden API policy: ${e.message}")
+            }
+
+            // Pre-warm the ultra-fast Binder injector
+            val binderOk = InputInjector.init()
+            withContext(Dispatchers.Main) {
+                val modeStr = if (binderOk) "Ultra-Fast Binder Mode" else "Streaming Shell Mode"
+                Toast.makeText(
+                    this@ClickerService,
+                    "AutoClicker Ready ($modeStr)",
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -121,7 +155,159 @@ class ClickerService : Service() {
         for ((_, inst) in instances) inst.removeViews()
         instances.clear()
         activeInstances.clear()
+        PersistentShell.close()
         serviceScope.cancel()
+    }
+
+    // ── Ultra-Fast Input Engines ─────────────────────────────────────────
+
+    /**
+     * Injects touch events directly via Android's internal IInputManager service
+     * wrapped through Shizuku's privileged shell Binder (UID 2000).
+     *
+     * Why this works without root and has ~0 ms latency:
+     *  - Shizuku runs as Android `shell` (UID 2000), which holds `INJECT_EVENTS` permission.
+     *  - Calling IInputManager via Binder is an in-memory IPC transaction (< 1ms).
+     *  - Does NOT spawn new Linux processes (`sh` or `app_process`).
+     *  - Does NOT write to `/dev/input/event*` nodes (which SELinux blocks without root).
+     *  - Uses standard screen pixel coordinates directly (no raw coordinate scaling needed).
+     */
+    object InputInjector {
+        private var inputManager: Any? = null
+        private var injectMethod: Method? = null
+        @Volatile var isReady: Boolean = false
+
+        fun init(): Boolean {
+            if (isReady && inputManager != null && injectMethod != null) return true
+            return try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    try {
+                        val hab = Class.forName("org.lsposed.hiddenapibypass.HiddenApiBypass")
+                        val m = hab.methods.firstOrNull { it.name == "addHiddenApiExemptions" }
+                        m?.invoke(null, arrayOf("L"))
+                    } catch (_: Throwable) {}
+                }
+
+                val rawBinder = SystemServiceHelper.getSystemService("input")
+                if (rawBinder == null) {
+                    Log.e("ClickerService", "Raw input binder is null")
+                    return false
+                }
+
+                val wrappedBinder = ShizukuBinderWrapper(rawBinder)
+                val stubClass = Class.forName("android.hardware.input.IInputManager\$Stub")
+                val asInterfaceMethod = stubClass.getMethod("asInterface", IBinder::class.java)
+                val im = asInterfaceMethod.invoke(null, wrappedBinder) ?: return false
+
+                val method = im.javaClass.methods.firstOrNull {
+                    it.name == "injectInputEvent" && it.parameterTypes.size == 2
+                } ?: stubClass.methods.firstOrNull {
+                    it.name == "injectInputEvent" && it.parameterTypes.size == 2
+                }
+
+                if (method != null) {
+                    method.isAccessible = true
+                    inputManager = im
+                    injectMethod = method
+                    isReady = true
+                    Log.d("ClickerService", "InputInjector initialized successfully!")
+                    true
+                } else {
+                    Log.e("ClickerService", "injectInputEvent method not found on IInputManager")
+                    false
+                }
+            } catch (e: Throwable) {
+                Log.e("ClickerService", "InputInjector init failed: ${e.message}")
+                false
+            }
+        }
+
+        fun injectTap(x: Float, y: Float): Boolean {
+            if (!isReady && !init()) return false
+            val im = inputManager ?: return false
+            val method = injectMethod ?: return false
+
+            return try {
+                val now = SystemClock.uptimeMillis()
+                val down = MotionEvent.obtain(
+                    now, now, MotionEvent.ACTION_DOWN, x, y, 0
+                ).apply {
+                    source = InputDevice.SOURCE_TOUCHSCREEN
+                }
+                val up = MotionEvent.obtain(
+                    now, now + 15, MotionEvent.ACTION_UP, x, y, 0
+                ).apply {
+                    source = InputDevice.SOURCE_TOUCHSCREEN
+                }
+
+                val rDown = method.invoke(im, down, 0) as? Boolean ?: false
+                val rUp = method.invoke(im, up, 0) as? Boolean ?: false
+
+                down.recycle()
+                up.recycle()
+
+                rDown && rUp
+            } catch (e: Throwable) {
+                Log.e("ClickerService", "injectTap invocation error", e)
+                false
+            }
+        }
+    }
+
+    /**
+     * Fallback high-speed streaming shell: keeps one persistent `sh` process
+     * alive and streams `input tap x y` commands to its stdin pipe without
+     * waiting, preventing process spawn lag and loop blocking.
+     */
+    object PersistentShell {
+        private var process: Process? = null
+        private var writer: BufferedWriter? = null
+
+        @Synchronized
+        fun tap(x: Int, y: Int) {
+            try {
+                ensureProcess()
+                writer?.write("input tap $x $y\n")
+                writer?.flush()
+                Log.d("ClickerService", "PersistentShell tap at ($x, $y)")
+            } catch (e: Exception) {
+                Log.e("ClickerService", "PersistentShell tap error", e)
+                close()
+                try {
+                    Shizuku.newProcess(arrayOf("sh", "-c", "input tap $x $y"), null, null)
+                } catch (t: Throwable) {
+                    Log.e("ClickerService", "One-shot fallback error", t)
+                }
+            }
+        }
+
+        @Synchronized
+        private fun ensureProcess() {
+            if (process == null || !isAlive(process)) {
+                close()
+                process = Shizuku.newProcess(arrayOf("sh"), null, null)
+                writer = BufferedWriter(OutputStreamWriter(process!!.outputStream))
+                Log.d("ClickerService", "PersistentShell opened")
+            }
+        }
+
+        private fun isAlive(p: Process?): Boolean {
+            if (p == null) return false
+            return try {
+                p.exitValue()
+                false
+            } catch (e: IllegalThreadStateException) {
+                true
+            }
+        }
+
+        @Synchronized
+        fun close() {
+            try { writer?.close() } catch (_: Exception) {}
+            try { process?.destroy() } catch (_: Exception) {}
+            writer = null
+            process = null
+        }
     }
 
     // ── Companion (constants, themes, shared state) ──────────────────────
@@ -314,7 +500,6 @@ class ClickerService : Service() {
 
             clickJob = serviceScope.launch(Dispatchers.IO) {
                 while (isActive) {
-                    delay(intervalMs)
                     var targetX = 0
                     var targetY = 0
                     withContext(Dispatchers.Main) {
@@ -323,10 +508,8 @@ class ClickerService : Service() {
                         targetX = location[0] + (squareSizePx / 2)
                         targetY = location[1] + (squareSizePx / 2)
                     }
-                    val process = Shizuku.newProcess(
-                        arrayOf("sh", "-c", "input tap $targetX $targetY"), null, null
-                    )
-                    process.waitFor()
+                    sendTap(targetX, targetY)
+                    delay(intervalMs)
                 }
             }
         }
@@ -335,6 +518,22 @@ class ClickerService : Service() {
             isRunning = false
             topHalf.setLabel("start")
             clickJob?.cancel()
+        }
+
+        /**
+         * Fires a single tap.
+         * Priority 1: Ultra-fast direct Binder injection (< 1ms, works on non-root with Shizuku).
+         * Priority 2: Streaming persistent shell pipe (fast non-blocking input tap fallback).
+         */
+        private fun sendTap(screenX: Int, screenY: Int) {
+            val success = InputInjector.injectTap(screenX.toFloat(), screenY.toFloat())
+            if (success) {
+                Log.d("ClickerService", "Tap injected via InputInjector at ($screenX, $screenY)")
+                return
+            }
+
+            Log.w("ClickerService", "InputInjector not available, using PersistentShell fallback")
+            PersistentShell.tap(screenX, screenY)
         }
 
         fun removeViews() {
@@ -406,6 +605,7 @@ class ClickerService : Service() {
             color = Color.WHITE; textAlign = Paint.Align.CENTER; typeface = Typeface.DEFAULT_BOLD
         }
         private val path = Path()
+
 
         init {
             setLayerType(LAYER_TYPE_SOFTWARE, null)

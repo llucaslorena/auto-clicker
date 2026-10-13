@@ -42,5 +42,6 @@ dependencies {
     androidTestImplementation(libs.androidx.junit)
     implementation("dev.rikka.shizuku:api:12.2.0") // Shizuku API
     implementation("dev.rikka.shizuku:provider:12.2.0")
+    implementation("org.lsposed.hiddenapibypass:hiddenapibypass:4.3") // Hidden API bypass for Android 9+
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3") // Coroutines (Required so the click loop doesn't freeze the app)
 }
